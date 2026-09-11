@@ -74,6 +74,54 @@ pub struct SystemSnapshot {
     pub last_result: String,
 }
 
+/// GUI 监控快照：frame 是已成功写屏内容，relay.chart 是独立更新的最新采样。
+#[derive(Clone, Debug)]
+pub struct DisplaySnapshot {
+    pub frame: Option<Vec<u8>>,
+    pub relay: Option<crate::ccswitch::RelayBalance>,
+}
+
+/// 在刷新锁内只读持久化状态；不查询网络、不采样、不写屏，锁忙时由 GUI 保留旧画面。
+pub fn read_display_snapshot() -> Result<DisplaySnapshot> {
+    let _lock = acquire_refresh_lock()?.ok_or_else(|| anyhow::anyhow!("后台正在刷新，稍后同步"))?;
+    let recorded = quota::read_recorded_status()?;
+    let chart = recorded
+        .as_ref()
+        .and_then(|value| value.relay.as_ref())
+        .map(|relay| quota::latest_consumption(&relay.unit))
+        .transpose()?;
+    assemble_display_snapshot(recorded, chart)
+}
+
+/// 先用已写屏记录重建帧，再单独替换统计数据，防止最新采样被误当作已写屏内容。
+fn assemble_display_snapshot(
+    recorded: Option<quota::RecordedStatus>,
+    chart: Option<crate::consumption::ConsumptionChart>,
+) -> Result<DisplaySnapshot> {
+    let Some(recorded) = recorded else {
+        return Ok(DisplaySnapshot {
+            frame: None,
+            relay: None,
+        });
+    };
+    let status = QuotaStatus {
+        relay: recorded.relay,
+        five_hour: recorded.five_hour,
+        seven_day: recorded.seven_day,
+        reset_cells: recorded.reset_cells,
+        seven_day_resets_at: None,
+    };
+    let frame = keyboard::build_static_frame(&status)?;
+    let relay = status.relay.map(|mut relay| {
+        relay.chart = chart.unwrap_or_default();
+        relay
+    });
+    Ok(DisplaySnapshot {
+        frame: Some(frame),
+        relay,
+    })
+}
+
 /// 持有跨进程独占文件锁，生命周期结束时自动释放。
 struct RefreshLock {
     file: File,
@@ -259,6 +307,65 @@ fn reset_cells_text(cells: Option<u8>) -> String {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+
+    /// 最新采样变化只能更新统计，不得改变最近成功写屏帧；缺缓存和官方模式保持明确空态。
+    #[test]
+    fn display_snapshot_keeps_recorded_frame_separate_from_live_chart() {
+        let empty = assemble_display_snapshot(None, None).unwrap();
+        assert!(empty.frame.is_none());
+        assert!(empty.relay.is_none());
+        let official = quota::RecordedStatus {
+            relay: None,
+            five_hour: Some(80),
+            seven_day: Some(20),
+            reset_cells: Some(6),
+        };
+        let snapshot = assemble_display_snapshot(Some(official), None).unwrap();
+        assert_eq!(
+            snapshot.frame.unwrap().len(),
+            keyboard::MATRIX_COLS * keyboard::MATRIX_ROWS * 3
+        );
+        assert!(snapshot.relay.is_none());
+        let mut status = QuotaStatus {
+            relay: Some(crate::ccswitch::RelayBalance {
+                chart: crate::consumption::ConsumptionChart {
+                    end_at: 1800,
+                    bars: [Some(0); 10],
+                },
+                provider_id: "fixture".to_owned(),
+                name: String::new(),
+                remaining: Some(20_000_000),
+                unit: "USD".to_owned(),
+                detail: String::new(),
+            }),
+            five_hour: None,
+            seven_day: None,
+            reset_cells: None,
+            seven_day_resets_at: None,
+        };
+        let written = keyboard::build_static_frame(&status).unwrap();
+        let latest = crate::consumption::ConsumptionChart {
+            end_at: 1800,
+            bars: [Some(5_000_000); 10],
+        };
+        let recorded = quota::RecordedStatus {
+            relay: status.relay.clone(),
+            five_hour: None,
+            seven_day: None,
+            reset_cells: None,
+        };
+        let snapshot =
+            assemble_display_snapshot(Some(recorded.clone()), Some(latest.clone())).unwrap();
+        assert_eq!(snapshot.frame.as_ref().unwrap(), &written);
+        assert_eq!(snapshot.relay.unwrap().chart, latest);
+        status.relay.as_mut().unwrap().chart = latest;
+        assert_ne!(
+            snapshot.frame.unwrap(),
+            keyboard::build_static_frame(&status).unwrap()
+        );
+        let missing_history = assemble_display_snapshot(Some(recorded), None).unwrap();
+        assert_eq!(missing_history.relay.unwrap().chart.bars, [None; 10]);
+    }
 
     /// 真机验收：读取当前 Codex 账号并强制写入 DP-104，同时验证 HID 回显。
     #[test]

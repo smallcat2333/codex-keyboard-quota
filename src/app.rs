@@ -1,8 +1,10 @@
 //! eframe/egui 中文图形界面与后台任务调度。
 
+use crate::consumption::{BAR_COUNT, WINDOW_SECONDS};
 use crate::deploy;
+use crate::keyboard::{MATRIX_COLS, MATRIX_ROWS};
 use crate::quota::QuotaStatus;
-use crate::service::{self, SystemSnapshot};
+use crate::service::{self, DisplaySnapshot, SystemSnapshot};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, unbounded};
 use eframe::egui;
@@ -58,6 +60,9 @@ enum WorkerEvent {
 /// 应用窗口状态。
 struct QuotaApp {
     snapshot: Option<SystemSnapshot>,
+    display: Option<DisplaySnapshot>,
+    display_error: Option<String>,
+    display_rx: Receiver<Result<DisplaySnapshot, String>>,
     details: String,
     busy: bool,
     current_task: Option<BackgroundTask>,
@@ -73,6 +78,9 @@ impl QuotaApp {
         let font_message = configure_fonts(&context.egui_ctx);
         let mut app = Self {
             snapshot: None,
+            display: None,
+            display_error: None,
+            display_rx: spawn_display_monitor(context.egui_ctx.clone()),
             details: format!(
                 "Codex 键盘额度工具 v{} 已启动。\n{}",
                 env!("CARGO_PKG_VERSION"),
@@ -282,6 +290,131 @@ impl QuotaApp {
         });
     }
 
+    /// 按写屏记录绘制原始 HSV 帧；缓存不可用时显示空态而不模拟键盘内容。
+    fn draw_keyboard_display(&self, ui: &mut egui::Ui) {
+        status_card(ui, "键盘点阵 · 24 × 8", |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "每秒同步最近成功写屏记录；键盘断电或其它程序改屏无法回读确认。",
+                )
+                .size(12.0)
+                .color(egui::Color32::from_gray(170)),
+            );
+            if let Some(error) = &self.display_error {
+                ui.colored_label(
+                    color_danger(),
+                    format!("同步暂不可用，保留上次画面：{error}"),
+                );
+            }
+            let Some(frame) = self
+                .display
+                .as_ref()
+                .and_then(|display| display.frame.as_ref())
+            else {
+                ui.add_space(12.0);
+                ui.label("尚无成功写屏记录，点击「测试显示」后展示。");
+                return;
+            };
+            ui.add_space(8.0);
+            let pitch = (ui.available_width() / MATRIX_COLS as f32).min(23.0);
+            let size = egui::vec2(pitch * MATRIX_COLS as f32, pitch * MATRIX_ROWS as f32);
+            ui.horizontal(|ui| {
+                ui.add_space(((ui.available_width() - size.x) / 2.0).max(0.0));
+                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, 8.0, egui::Color32::from_rgb(8, 12, 18));
+                for (index, hsv) in frame.chunks_exact(3).enumerate() {
+                    let center = rect.min
+                        + egui::vec2(
+                            (index % MATRIX_COLS) as f32 + 0.5,
+                            (index / MATRIX_COLS) as f32 + 0.5,
+                        ) * pitch;
+                    ui.painter()
+                        .circle_filled(center, pitch * 0.30, pixel_color(hsv));
+                }
+            });
+        });
+    }
+
+    /// 展示写屏来源同币种的最新采样，区分当前累计、已完成周期和未知数据。
+    fn draw_consumption(&self, ui: &mut egui::Ui) {
+        status_card(ui, "30 min 消耗统计", |ui| {
+            let Some(relay) = self
+                .display
+                .as_ref()
+                .and_then(|display| display.relay.as_ref())
+            else {
+                ui.label("中转站模式显示半小时消耗；官方额度不提供金额统计。");
+                return;
+            };
+            if relay.chart.end_at == 0 {
+                ui.label("尚无消耗采样，请部署每分钟采样或使用「测试显示」。");
+                return;
+            }
+            ui.horizontal(|ui| {
+                ui.label("当前周期累计");
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {}",
+                        consumption_text(relay.chart.bars[BAR_COUNT - 1]),
+                        relay.unit
+                    ))
+                    .size(24.0)
+                    .color(color_accent()),
+                );
+                ui.label(format!("{} 起", period_time(relay.chart.end_at)));
+            });
+            ui.label(egui::RichText::new("每列 30 分钟，右侧最新；采样每分钟更新，点阵按写屏阈值更新。-- 表示无数据或采样中断。")
+                .size(12.0).color(egui::Color32::from_gray(170)));
+            if chrono::Utc::now().timestamp() >= relay.chart.end_at + WINDOW_SECONDS {
+                ui.colored_label(color_danger(), "采样周期尚未更新，以下为最近保存的数据。");
+            }
+            ui.add_space(8.0);
+            egui::ScrollArea::horizontal()
+                .id_salt("consumption_periods")
+                .show(ui, |ui| {
+                    egui::Grid::new("consumption_values")
+                        .spacing([16.0, 6.0])
+                        .show(ui, |ui| {
+                            for index in 0..BAR_COUNT {
+                                let start = relay.chart.end_at
+                                    - (BAR_COUNT - 1 - index) as i64 * WINDOW_SECONDS;
+                                ui.label(period_time(start)).on_hover_text(
+                                    chrono::DateTime::from_timestamp(start, 0)
+                                        .map(|time| {
+                                            time.with_timezone(&chrono::Local)
+                                                .format("%Y-%m-%d %H:%M")
+                                                .to_string()
+                                        })
+                                        .unwrap_or_else(|| "无效时间".to_owned()),
+                                );
+                            }
+                            ui.end_row();
+                            for index in 0..BAR_COUNT {
+                                let end = relay.chart.end_at
+                                    - (BAR_COUNT - 2) as i64 * WINDOW_SECONDS
+                                    + index as i64 * WINDOW_SECONDS;
+                                ui.small(format!("至 {}", period_time(end)));
+                            }
+                            ui.end_row();
+                            for (index, amount) in relay.chart.bars.iter().enumerate() {
+                                let color = if index == BAR_COUNT - 1 {
+                                    color_accent()
+                                } else {
+                                    egui::Color32::WHITE
+                                };
+                                ui.colored_label(color, consumption_text(*amount));
+                            }
+                            ui.end_row();
+                        });
+                });
+            ui.small(format!(
+                "金额单位：{} · 同币种供应商合计 · 最右列为该周期内累计",
+                relay.unit
+            ));
+        });
+    }
+
     /// 绘制底部只读、可滚动详情框。
     fn draw_details(&mut self, ui: &mut egui::Ui) {
         ui.heading("运行详情");
@@ -305,6 +438,15 @@ impl eframe::App for QuotaApp {
     /// 每帧接收后台结果并绘制完整窗口。
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
+        while let Ok(result) = self.display_rx.try_recv() {
+            match result {
+                Ok(display) => {
+                    self.display = Some(display);
+                    self.display_error = None;
+                }
+                Err(error) => self.display_error = Some(error),
+            }
+        }
         if self.busy {
             context.request_repaint_after(Duration::from_millis(100));
         }
@@ -362,6 +504,10 @@ impl eframe::App for QuotaApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
+                    self.draw_keyboard_display(ui);
+                    ui.add_space(10.0);
+                    self.draw_consumption(ui);
+                    ui.add_space(10.0);
                     ui.columns(2, |columns| {
                         self.draw_connection_status(&mut columns[0]);
                         self.draw_quota_status(&mut columns[1]);
@@ -375,12 +521,65 @@ impl eframe::App for QuotaApp {
     }
 }
 
+/// 每秒只读本地记录，不查询网络或写 HID；窗口关闭后接收端释放，线程退出。
+fn spawn_display_monitor(context: egui::Context) -> Receiver<Result<DisplaySnapshot, String>> {
+    let (sender, receiver) = crossbeam_channel::bounded(1);
+    thread::spawn(move || {
+        loop {
+            let result = service::read_display_snapshot().map_err(|error| format!("{error:#}"));
+            match sender.try_send(result) {
+                Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => context.request_repaint(),
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
+    receiver
+}
+
+/// 将键盘 8 位 HSV 映射到 GUI RGB；未点亮的像素保留暗色轮廓。
+fn pixel_color(hsv: &[u8]) -> egui::Color32 {
+    if hsv[2] == 0 {
+        egui::Color32::from_rgb(28, 36, 47)
+    } else {
+        egui::ecolor::Hsva::new(
+            hsv[0] as f32 / 255.0,
+            hsv[1] as f32 / 255.0,
+            hsv[2] as f32 / 255.0,
+            1.0,
+        )
+        .into()
+    }
+}
+
+/// 百万分之一金额以小数原精度展示；未知采样与有效零值保持区分。
+fn consumption_text(amount: Option<u64>) -> String {
+    match amount {
+        None => "--".to_owned(),
+        Some(amount) => {
+            let text = format!("{}.{:06}", amount / 1_000_000, amount % 1_000_000);
+            text.trim_end_matches('0').trim_end_matches('.').to_owned()
+        }
+    }
+}
+
+/// 转换采样时间到本地时分；区间起点的悬浮提示提供完整日期。
+fn period_time(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "无效时间".to_owned())
+}
+
 /// 启动本地 GUI 窗口。
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
-            .with_inner_size([900.0, 690.0])
+            .with_inner_size([960.0, 960.0])
             .with_min_inner_size([760.0, 610.0])
             .with_icon(app_icon()),
         renderer: eframe::Renderer::Wgpu,
@@ -640,4 +839,101 @@ fn color_danger() -> egui::Color32 {
 /// 返回版本及沙漏使用的粉紫强调色。
 fn color_accent() -> egui::Color32 {
     egui::Color32::from_rgb(201, 126, 224)
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    /// 金额精度不能把微量消耗显示为零，也不能把采样缺失当作零。
+    #[test]
+    fn preserves_consumption_precision_and_missing_values() {
+        assert_eq!(consumption_text(None), "--");
+        assert_eq!(consumption_text(Some(0)), "0");
+        assert_eq!(consumption_text(Some(1)), "0.000001");
+        assert_eq!(consumption_text(Some(2_500_000)), "2.5");
+        assert_eq!(consumption_text(Some(u64::MAX)), "18446744073709.551615");
+    }
+
+    /// 验证无缓存、官方及中转点阵可在窄窗口完成真实 egui 布局与绘制。
+    #[test]
+    fn renders_monitor_states_at_minimum_width() {
+        let context = egui::Context::default();
+        let (_, receiver) = crossbeam_channel::bounded(1);
+        let mut app = QuotaApp {
+            snapshot: None,
+            display: None,
+            display_error: None,
+            display_rx: receiver,
+            details: String::new(),
+            busy: false,
+            current_task: None,
+            worker_rx: None,
+            close_requested: false,
+            startup_repaints: 0,
+        };
+        let mut status = QuotaStatus {
+            relay: None,
+            five_hour: Some(60),
+            seven_day: Some(19),
+            seven_day_resets_at: None,
+            reset_cells: Some(8),
+        };
+        for state in 0..3 {
+            if state == 2 {
+                status.relay = Some(crate::ccswitch::RelayBalance {
+                    chart: crate::consumption::ConsumptionChart {
+                        end_at: chrono::Utc::now().timestamp(),
+                        bars: [
+                            None,
+                            Some(0),
+                            Some(1),
+                            Some(1_000_000),
+                            Some(2_000_000),
+                            Some(3_000_000),
+                            Some(4_000_000),
+                            Some(5_000_000),
+                            None,
+                            Some(2_500_000),
+                        ],
+                    },
+                    provider_id: "fixture".to_owned(),
+                    name: "fixture".to_owned(),
+                    remaining: Some(148_000_000),
+                    unit: "USD".to_owned(),
+                    detail: String::new(),
+                });
+            }
+            if state > 0 {
+                app.display = Some(DisplaySnapshot {
+                    frame: Some(crate::keyboard::build_static_frame(&status).unwrap()),
+                    relay: status.relay.clone(),
+                });
+            }
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(760.0, 610.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        app.draw_keyboard_display(ui);
+                        app.draw_consumption(ui);
+                    });
+                },
+            );
+            assert!(!output.shapes.is_empty());
+            if state > 0 {
+                let circles = output
+                    .shapes
+                    .iter()
+                    .filter(|shape| matches!(shape.shape, egui::epaint::Shape::Circle(_)))
+                    .count();
+                assert_eq!(circles, MATRIX_COLS * MATRIX_ROWS);
+            }
+        }
+    }
 }
