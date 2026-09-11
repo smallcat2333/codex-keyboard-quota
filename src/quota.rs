@@ -107,7 +107,6 @@ pub fn should_refresh(current: &QuotaStatus, recorded: Option<&RecordedStatus>) 
         (Some(current), Some(recorded)) => {
             return current.provider_id != recorded.provider_id
                 || current.unit != recorded.unit
-                || current.chart != recorded.chart
                 || match (current.remaining, recorded.remaining) {
                     (Some(current), Some(recorded)) => current.abs_diff(recorded) >= 1_000_000,
                     (current, recorded) => current != recorded,
@@ -343,7 +342,8 @@ mod tests {
         });
         let recorded = current.recorded();
         current.relay.as_mut().unwrap().chart.end_at = 1800;
-        assert!(should_refresh(&current, Some(&recorded)));
+        current.relay.as_mut().unwrap().chart.bars[9] = Some(5_000_000);
+        assert!(!should_refresh(&current, Some(&recorded)));
         current.relay.as_mut().unwrap().chart.end_at = 0;
         current.relay.as_mut().unwrap().remaining = Some(147_100_001);
         assert!(!should_refresh(&current, Some(&recorded)));

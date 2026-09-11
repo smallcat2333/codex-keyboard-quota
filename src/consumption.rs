@@ -7,7 +7,7 @@ pub const BAR_COUNT: usize = 10;
 pub const WINDOW_SECONDS: i64 = 30 * 60;
 const MAX_SAMPLE_GAP_SECONDS: i64 = 120;
 
-/// 已完成的十个半小时周期，从左到右由旧到新；None 表示尚无数据或采样中断。
+/// 十根半小时消耗柱，从左到右由旧到新；None 表示尚无数据或采样中断。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsumptionChart {
     pub end_at: i64,
@@ -77,27 +77,41 @@ impl ConsumptionHistory {
         self.balances.insert(provider.to_owned(), balance);
     }
 
-    /// 仅暴露已完成周期，未满半小时的累计值不会改变键盘柱图。
+    /// 展示最近九个已完成周期及最右侧的当前累计；调用方只在余额触发时写屏。
     pub fn chart(&self) -> ConsumptionChart {
-        self.chart.clone()
+        let mut chart = self.chart.clone();
+        chart.bars.rotate_left(1);
+        chart.bars[BAR_COUNT - 1] = self.complete.then_some(self.consumed);
+        chart
     }
 }
 
-/// 按半小时累计消耗映射 0–5 个点；阈值等号属于下一档。
+/// 半小时累计消耗每满 1 USD 点亮一个点，最多五点；金额单位为百万分之一。
 pub fn consumption_level(amount: u64) -> usize {
-    match amount {
-        0..100_000 => 0,
-        100_000..1_000_000 => 1,
-        1_000_000..2_000_000 => 2,
-        2_000_000..5_000_000 => 3,
-        5_000_000..10_000_000 => 4,
-        _ => 5,
-    }
+    (amount / 1_000_000).min(5) as usize
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 最右侧立即展示当前累计，满半小时后左移为历史，新周期从零开始。
+    #[test]
+    fn exposes_live_consumption_before_window_completes() {
+        let mut history = ConsumptionHistory::new(0, "A", Some(100_000_000));
+        history.sample(60, "A", Some(97_500_000));
+        assert_eq!(history.chart().bars[9], Some(2_500_000));
+        assert_eq!(history.chart().bars[8], None);
+        for minute in 2..=30 {
+            history.sample(minute * 60, "A", Some(97_500_000));
+        }
+        assert_eq!(&history.chart().bars[8..], &[Some(2_500_000), Some(0)]);
+        history.sample(1860, "A", Some(96_500_000));
+        assert_eq!(
+            &history.chart().bars[8..],
+            &[Some(2_500_000), Some(1_000_000)]
+        );
+    }
 
     /// A 消耗 2、B 消耗 1 合并为 3；切回 A 重新建基线，不计入其停用期间的余额差。
     #[test]
@@ -112,7 +126,7 @@ mod tests {
         for minute in 5..=30 {
             history.sample(minute * 60, "A", Some(50_000_000));
         }
-        assert_eq!(history.chart().bars[9], Some(3_000_000));
+        assert_eq!(history.chart.bars[9], Some(3_000_000));
         assert_eq!(history.balances["A"], Some(50_000_000));
         assert_eq!(history.balances["B"], Some(9_000_000));
         assert_eq!(history.chart().end_at, 1800);
@@ -126,32 +140,33 @@ mod tests {
             history.sample(minute * 60, "A", Some(98_000_000));
         }
         history.sample(1800, "B", Some(10_000_000));
-        assert_eq!(history.chart().bars[9], Some(2_000_000));
+        assert_eq!(history.chart.bars[9], Some(2_000_000));
         for minute in 31..=60 {
             history.sample(minute * 60, "B", Some(9_000_000));
         }
         assert_eq!(
-            &history.chart().bars[8..],
+            &history.chart.bars[8..],
             &[Some(2_000_000), Some(1_000_000)]
         );
         assert_eq!(history.chart().end_at, 3600);
     }
 
-    /// 验证所有档位边界，不对低于 0.1 的消耗点亮柱子。
+    /// 验证每满 1 USD 增加一点，恰好 5 USD 及更高消耗均封顶五点。
     #[test]
     fn levels_follow_exact_thresholds() {
         for (amount, expected) in [
             (0, 0),
-            (99_999, 0),
-            (100_000, 1),
-            (999_999, 1),
-            (1_000_000, 2),
-            (1_999_999, 2),
-            (2_000_000, 3),
-            (4_999_999, 3),
-            (5_000_000, 4),
-            (9_999_999, 4),
-            (10_000_000, 5),
+            (999_999, 0),
+            (1_000_000, 1),
+            (1_999_999, 1),
+            (2_000_000, 2),
+            (2_999_999, 2),
+            (3_000_000, 3),
+            (3_999_999, 3),
+            (4_000_000, 4),
+            (4_999_999, 4),
+            (5_000_000, 5),
+            (u64::MAX, 5),
         ] {
             assert_eq!(consumption_level(amount), expected);
         }
@@ -168,16 +183,16 @@ mod tests {
                 Some(100_000_000 - minute * 100_000),
             );
         }
-        assert_eq!(history.chart().bars, [None; BAR_COUNT]);
+        assert_eq!(history.chart.bars, [None; BAR_COUNT]);
         let json = serde_json::to_string(&history).unwrap();
         let mut history: ConsumptionHistory = serde_json::from_str(&json).unwrap();
         history.sample(2800, "A", Some(97_000_000));
-        assert_eq!(history.chart().bars[9], Some(3_000_000));
+        assert_eq!(history.chart.bars[9], Some(3_000_000));
         assert_eq!(history.chart().end_at, 2800);
         for minute in 1..=30 {
             history.sample(2800 + minute * 60, "A", Some(97_000_000));
         }
-        assert_eq!(&history.chart().bars[8..], &[Some(3_000_000), Some(0)]);
+        assert_eq!(&history.chart.bars[8..], &[Some(3_000_000), Some(0)]);
     }
 
     /// 充值后只累计下降值，避免充值抹掉已发生的消耗。
@@ -189,7 +204,7 @@ mod tests {
         for minute in 3..=30 {
             history.sample(minute * 60, "A", Some(19_000_000));
         }
-        assert_eq!(history.chart().bars[9], Some(2_000_000));
+        assert_eq!(history.chart.bars[9], Some(2_000_000));
     }
 
     /// 验证停机、查询失败及恢复不会把未知时段当作零消耗或一个巨大尖峰。
@@ -200,12 +215,12 @@ mod tests {
         for minute in 2..=30 {
             history.sample(minute * 60, "A", Some(90_000_000));
         }
-        assert_eq!(history.chart().bars[9], None);
+        assert_eq!(history.chart.bars[9], None);
         for minute in 31..=60 {
             history.sample(minute * 60, "A", Some(90_000_000));
         }
-        assert_eq!(history.chart().bars[9], Some(0));
+        assert_eq!(history.chart.bars[9], Some(0));
         history.sample(3600 + 12 * WINDOW_SECONDS, "A", Some(1_000_000));
-        assert_eq!(history.chart().bars, [None; BAR_COUNT]);
+        assert_eq!(history.chart.bars, [None; BAR_COUNT]);
     }
 }

@@ -310,11 +310,11 @@ mod tests {
                 None,
                 None,
                 Some(0),
-                Some(100_000),
                 Some(1_000_000),
                 Some(2_000_000),
+                Some(3_000_000),
+                Some(4_000_000),
                 Some(5_000_000),
-                Some(10_000_000),
             ],
         };
         let frame = build_balance_frame("999", &chart).unwrap();
