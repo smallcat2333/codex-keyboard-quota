@@ -253,24 +253,21 @@ pub fn write_recorded_status(status: &QuotaStatus) -> Result<()> {
     Ok(())
 }
 
-/// 每次查询都持久化采样，独立于 HID 刷新阈值；按供应商与单位隔离历史。
+/// 每次查询都持久化独立余额基线，同币种供应商共用消耗时间轴，独立于 HID 刷新阈值。
 pub fn sample_consumption(relay: &mut RelayBalance, now: i64) -> Result<()> {
     let current_user = RegKey::predef(HKEY_CURRENT_USER);
     let (key, _) = current_user
         .create_subkey(REGISTRY_PATH)
         .context("无法创建消耗采样缓存")?;
-    let name = format!(
-        "Consumption:{}",
-        serde_json::to_string(&(&relay.provider_id, &relay.unit))?
-    );
+    let name = format!("SharedConsumption:{}", serde_json::to_string(&relay.unit)?);
     let mut history: ConsumptionHistory = match key.get_value::<String, _>(&name) {
         Ok(text) => serde_json::from_str(&text).context("消耗采样缓存格式错误")?,
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            ConsumptionHistory::new(now, relay.remaining)
+            ConsumptionHistory::new(now, &relay.provider_id, relay.remaining)
         }
         Err(error) => return Err(error).context("无法读取消耗采样缓存"),
     };
-    history.sample(now, relay.remaining);
+    history.sample(now, &relay.provider_id, relay.remaining);
     relay.chart = history.chart();
     key.set_value(&name, &serde_json::to_string(&history)?)
         .context("无法保存消耗采样缓存")?;
