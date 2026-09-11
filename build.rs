@@ -21,8 +21,8 @@ fn main() {
         .set("ProductName", "Codex 键盘额度工具")
         .set("FileDescription", "Codex 键盘额度工具")
         .set("LegalCopyright", "smallcat")
-        .set("FileVersion", "0.1.0.0")
-        .set("ProductVersion", "0.1.0.0");
+        .set("FileVersion", "0.2.0.0")
+        .set("ProductVersion", "0.2.0.0");
     resource.compile().expect("无法编译 Windows 资源");
 }
 

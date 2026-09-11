@@ -79,6 +79,7 @@ pub struct SystemSnapshot {
 pub struct DisplaySnapshot {
     pub frame: Option<Vec<u8>>,
     pub relay: Option<crate::ccswitch::RelayBalance>,
+    pub sampled_at: Option<i64>,
 }
 
 /// 在刷新锁内只读持久化状态；不查询网络、不采样、不写屏，锁忙时由 GUI 保留旧画面。
@@ -89,19 +90,21 @@ pub fn read_display_snapshot() -> Result<DisplaySnapshot> {
         .as_ref()
         .and_then(|value| value.relay.as_ref())
         .map(|relay| quota::latest_consumption(&relay.unit))
-        .transpose()?;
+        .transpose()?
+        .flatten();
     assemble_display_snapshot(recorded, chart)
 }
 
 /// 先用已写屏记录重建帧，再单独替换统计数据，防止最新采样被误当作已写屏内容。
 fn assemble_display_snapshot(
     recorded: Option<quota::RecordedStatus>,
-    chart: Option<crate::consumption::ConsumptionChart>,
+    sampling: Option<(crate::consumption::ConsumptionChart, i64)>,
 ) -> Result<DisplaySnapshot> {
     let Some(recorded) = recorded else {
         return Ok(DisplaySnapshot {
             frame: None,
             relay: None,
+            sampled_at: None,
         });
     };
     let status = QuotaStatus {
@@ -112,13 +115,15 @@ fn assemble_display_snapshot(
         seven_day_resets_at: None,
     };
     let frame = keyboard::build_static_frame(&status)?;
+    let sampled_at = sampling.as_ref().map(|(_, timestamp)| *timestamp);
     let relay = status.relay.map(|mut relay| {
-        relay.chart = chart.unwrap_or_default();
+        relay.chart = sampling.map(|(chart, _)| chart).unwrap_or_default();
         relay
     });
     Ok(DisplaySnapshot {
         frame: Some(frame),
         relay,
+        sampled_at,
     })
 }
 
@@ -355,7 +360,9 @@ mod integration_tests {
             reset_cells: None,
         };
         let snapshot =
-            assemble_display_snapshot(Some(recorded.clone()), Some(latest.clone())).unwrap();
+            assemble_display_snapshot(Some(recorded.clone()), Some((latest.clone(), 1860)))
+                .unwrap();
+        assert_eq!(snapshot.sampled_at, Some(1860));
         assert_eq!(snapshot.frame.as_ref().unwrap(), &written);
         assert_eq!(snapshot.relay.unwrap().chart, latest);
         status.relay.as_mut().unwrap().chart = latest;

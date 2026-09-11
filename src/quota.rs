@@ -273,22 +273,22 @@ pub fn sample_consumption(relay: &mut RelayBalance, now: i64) -> Result<()> {
     Ok(())
 }
 
-/// 按币种只读最新采样历史，缺失时返回未知柱；格式或权限错误向调用方报告。
-pub fn latest_consumption(unit: &str) -> Result<ConsumptionChart> {
+/// 按币种只读最新采样柱和时间；缺失返回 None，格式或权限错误向调用方报告。
+pub fn latest_consumption(unit: &str) -> Result<Option<(ConsumptionChart, i64)>> {
     let key = match RegKey::predef(HKEY_CURRENT_USER).open_subkey(REGISTRY_PATH) {
         Ok(key) => key,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(ConsumptionChart::default()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("无法打开消耗采样缓存"),
     };
     let value_name = format!("SharedConsumption:{}", serde_json::to_string(unit)?);
     let text: String = match key.get_value(&value_name) {
         Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(ConsumptionChart::default()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("无法读取最新消耗采样"),
     };
     let history: ConsumptionHistory =
         serde_json::from_str(&text).context("消耗采样缓存格式错误")?;
-    Ok(history.chart())
+    Ok(Some((history.chart(), history.checked_at())))
 }
 
 /// 删除本工具在当前用户下的全部额度缓存。

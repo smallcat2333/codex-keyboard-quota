@@ -82,7 +82,7 @@ impl QuotaApp {
             display_error: None,
             display_rx: spawn_display_monitor(context.egui_ctx.clone()),
             details: format!(
-                "Codex 键盘额度工具 v{} 已启动。\n{}",
+                "Codex 键盘额度工具 V{} 已启动。\n{}",
                 env!("CARGO_PKG_VERSION"),
                 font_message
             ),
@@ -161,40 +161,42 @@ impl QuotaApp {
         }
     }
 
-    /// 绘制连接状态卡。
+    /// 横排三个连接状态，保留悬浮详情，减少点阵下方占用。
     fn draw_connection_status(&self, ui: &mut egui::Ui) {
         status_card(ui, "连接状态", |ui| {
-            let snapshot = self.snapshot.as_ref();
-            connection_row(
-                ui,
-                "DP-104",
-                snapshot.map(|value| value.keyboard_connected),
-                snapshot
-                    .map(|value| value.keyboard_detail.as_str())
-                    .unwrap_or("检测中"),
-            );
-            connection_row(
-                ui,
-                "额度来源",
-                snapshot.map(|value| value.codex_connected),
-                snapshot
-                    .map(|value| value.codex_detail.as_str())
-                    .unwrap_or("检测中"),
-            );
-            connection_row(
-                ui,
-                "自动刷新",
-                snapshot.map(|value| value.deployed),
-                snapshot
-                    .map(|value| {
-                        if value.deployed {
-                            "已部署，每分钟检测"
-                        } else {
-                            "未部署"
-                        }
-                    })
-                    .unwrap_or("检测中"),
-            );
+            ui.horizontal(|ui| {
+                let snapshot = self.snapshot.as_ref();
+                connection_row(
+                    ui,
+                    "DP-104",
+                    snapshot.map(|value| value.keyboard_connected),
+                    snapshot
+                        .map(|value| value.keyboard_detail.as_str())
+                        .unwrap_or("检测中"),
+                );
+                connection_row(
+                    ui,
+                    "额度来源",
+                    snapshot.map(|value| value.codex_connected),
+                    snapshot
+                        .map(|value| value.codex_detail.as_str())
+                        .unwrap_or("检测中"),
+                );
+                connection_row(
+                    ui,
+                    "自动刷新",
+                    snapshot.map(|value| value.deployed),
+                    snapshot
+                        .map(|value| {
+                            if value.deployed {
+                                "已部署，每分钟检测"
+                            } else {
+                                "未部署"
+                            }
+                        })
+                        .unwrap_or("检测中"),
+                );
+            });
         });
     }
 
@@ -206,17 +208,28 @@ impl QuotaApp {
                 .as_ref()
                 .and_then(|value| value.quota.as_ref());
             if let Some(relay) = quota.and_then(|value| value.relay.as_ref()) {
-                text_row(ui, "中转站", &relay.name);
-                text_row(
-                    ui,
-                    "剩余额度",
-                    &format!("{} {}", relay.display_text(), relay.unit),
-                );
+                ui.columns(2, |columns| {
+                    text_row(&mut columns[0], "中转站", &relay.name);
+                    text_row(
+                        &mut columns[1],
+                        "剩余额度",
+                        &format!("{} {}", relay.display_text(), relay.unit),
+                    );
+                });
                 text_row(ui, "查询状态", &relay.detail);
-                text_row(ui, "消耗柱", "10 柱 × 30 分钟累计，最右侧最新");
             } else {
-                quota_row(ui, "5h 额度", quota.and_then(|value| value.five_hour));
-                quota_row(ui, "周额度", quota.and_then(|value| value.seven_day));
+                ui.columns(2, |columns| {
+                    quota_row(
+                        &mut columns[0],
+                        "5h 额度",
+                        quota.and_then(|value| value.five_hour),
+                    );
+                    quota_row(
+                        &mut columns[1],
+                        "周额度",
+                        quota.and_then(|value| value.seven_day),
+                    );
+                });
                 text_row(
                     ui,
                     "周重置时间",
@@ -243,24 +256,16 @@ impl QuotaApp {
                     .map(|value| value.checked_at.as_str())
                     .unwrap_or("--"),
             );
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(
-                    self.snapshot
-                        .as_ref()
-                        .map(|value| value.last_result.as_str())
-                        .unwrap_or("正在读取当前账号额度……"),
-                )
-                .size(12.5)
-                .color(egui::Color32::from_gray(175)),
-            );
         });
     }
 
-    /// 绘制三项主操作按钮及其执行状态。
+    /// 操作区固定为按钮与状态一行、操作说明一行。
     fn draw_actions(&mut self, ui: &mut egui::Ui) {
-        status_card(ui, "操作", |ui| {
+        egui::Frame::group(ui.style()).inner_margin(10).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
+                ui.heading("操作");
+                ui.add_space(8.0);
                 if action_button(ui, "测试显示", color_primary(), self.busy).clicked() {
                     self.spawn_task(BackgroundTask::TestDisplay);
                 }
@@ -279,7 +284,7 @@ impl QuotaApp {
                     );
                 }
             });
-            ui.add_space(7.0);
+            ui.add_space(2.0);
             ui.label(
                 egui::RichText::new(
                     "测试显示会忽略阈值并立即写入；部署后每分钟查询，只有额度达到变化规则才刷新键盘。",
@@ -351,12 +356,18 @@ impl QuotaApp {
                 ui.label("尚无消耗采样，请部署每分钟采样或使用「测试显示」。");
                 return;
             }
+            let sampled_at = self.display.as_ref().and_then(|display| display.sampled_at);
+            let stale = sampling_is_stale(sampled_at, chrono::Utc::now().timestamp());
             ui.horizontal(|ui| {
                 ui.label("当前周期累计");
                 ui.label(
                     egui::RichText::new(format!(
                         "{} {}",
-                        consumption_text(relay.chart.bars[BAR_COUNT - 1]),
+                        consumption_text(if stale {
+                            None
+                        } else {
+                            relay.chart.bars[BAR_COUNT - 1]
+                        }),
                         relay.unit
                     ))
                     .size(24.0)
@@ -364,70 +375,94 @@ impl QuotaApp {
                 );
                 ui.label(format!("{} 起", period_time(relay.chart.end_at)));
             });
-            ui.label(egui::RichText::new("每列 30 分钟，右侧最新；采样每分钟更新，点阵按写屏阈值更新。-- 表示无数据或采样中断。")
-                .size(12.0).color(egui::Color32::from_gray(170)));
-            if chrono::Utc::now().timestamp() >= relay.chart.end_at + WINDOW_SECONDS {
-                ui.colored_label(color_danger(), "采样周期尚未更新，以下为最近保存的数据。");
+            ui.label(
+                egui::RichText::new("每格 30 分钟，按从左到右、从上到下排序；右下角为当前周期。")
+                    .size(12.0)
+                    .color(egui::Color32::from_gray(170)),
+            );
+            ui.small(format!(
+                "最近采样：{}",
+                sampled_at
+                    .map(|timestamp| {
+                        chrono::DateTime::from_timestamp(timestamp, 0)
+                            .unwrap()
+                            .with_timezone(&chrono::Local)
+                            .format("%m-%d %H:%M:%S")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "--".to_owned())
+            ));
+            if stale {
+                ui.colored_label(
+                    color_danger(),
+                    "采样已停止更新，请用「一键部署」更新后台程序。",
+                );
             }
-            ui.add_space(8.0);
+            ui.add_space(4.0);
             egui::ScrollArea::horizontal()
                 .id_salt("consumption_periods")
                 .show(ui, |ui| {
                     egui::Grid::new("consumption_values")
-                        .spacing([16.0, 6.0])
+                        .spacing([16.0, 4.0])
                         .show(ui, |ui| {
-                            for index in 0..BAR_COUNT {
-                                let start = relay.chart.end_at
-                                    - (BAR_COUNT - 1 - index) as i64 * WINDOW_SECONDS;
-                                ui.label(period_time(start)).on_hover_text(
-                                    chrono::DateTime::from_timestamp(start, 0)
-                                        .map(|time| {
-                                            time.with_timezone(&chrono::Local)
-                                                .format("%Y-%m-%d %H:%M")
-                                                .to_string()
-                                        })
-                                        .unwrap_or_else(|| "无效时间".to_owned()),
-                                );
+                            for row_start in [0, 5] {
+                                for index in row_start..row_start + 5 {
+                                    let start = relay.chart.end_at
+                                        - (BAR_COUNT - 1 - index) as i64 * WINDOW_SECONDS;
+                                    ui.small(format!(
+                                        "{}–{}",
+                                        period_time(start),
+                                        period_time(start + WINDOW_SECONDS)
+                                    ))
+                                    .on_hover_text(
+                                        chrono::DateTime::from_timestamp(start, 0)
+                                            .map(|time| {
+                                                time.with_timezone(&chrono::Local)
+                                                    .format("%Y-%m-%d %H:%M")
+                                                    .to_string()
+                                            })
+                                            .unwrap_or_else(|| "无效时间".to_owned()),
+                                    );
+                                }
+                                ui.end_row();
+                                for index in row_start..row_start + 5 {
+                                    let color = if index == BAR_COUNT - 1 {
+                                        color_accent()
+                                    } else {
+                                        egui::Color32::WHITE
+                                    };
+                                    let amount = if stale && index == BAR_COUNT - 1 {
+                                        None
+                                    } else {
+                                        relay.chart.bars[index]
+                                    };
+                                    ui.colored_label(color, consumption_text(amount));
+                                }
+                                ui.end_row();
                             }
-                            ui.end_row();
-                            for index in 0..BAR_COUNT {
-                                let end = relay.chart.end_at
-                                    - (BAR_COUNT - 2) as i64 * WINDOW_SECONDS
-                                    + index as i64 * WINDOW_SECONDS;
-                                ui.small(format!("至 {}", period_time(end)));
-                            }
-                            ui.end_row();
-                            for (index, amount) in relay.chart.bars.iter().enumerate() {
-                                let color = if index == BAR_COUNT - 1 {
-                                    color_accent()
-                                } else {
-                                    egui::Color32::WHITE
-                                };
-                                ui.colored_label(color, consumption_text(*amount));
-                            }
-                            ui.end_row();
                         });
                 });
             ui.small(format!(
-                "金额单位：{} · 同币种供应商合计 · 最右列为该周期内累计",
+                "金额单位：{} · 同币种合计 · -- 表示无数据或采样中断",
                 relay.unit
             ));
         });
     }
 
-    /// 绘制底部只读、可滚动详情框。
+    /// 运行详情独占底部剩余高度，只滚动详情内容，不把操作区推出窗口。
     fn draw_details(&mut self, ui: &mut egui::Ui) {
         ui.heading("运行详情");
         ui.add_space(6.0);
         egui::ScrollArea::vertical()
+            .id_salt("run_details")
             .stick_to_bottom(true)
             .auto_shrink([false; 2])
             .show(ui, |ui| {
-                ui.add(
+                ui.add_sized(
+                    ui.available_size(),
                     egui::TextEdit::multiline(&mut self.details)
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY)
-                        .desired_rows(12)
                         .interactive(false),
                 );
             });
@@ -461,7 +496,7 @@ impl eframe::App for QuotaApp {
 
         egui::TopBottomPanel::top("header")
             .resizable(false)
-            .exact_height(72.0)
+            .exact_height(64.0)
             .show(context, |ui| {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -472,7 +507,7 @@ impl eframe::App for QuotaApp {
                     );
                     ui.add_space(10.0);
                     ui.label(
-                        egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        egui::RichText::new(format!("V{}", env!("CARGO_PKG_VERSION")))
                             .size(13.0)
                             .color(color_accent()),
                     );
@@ -487,9 +522,9 @@ impl eframe::App for QuotaApp {
 
         egui::TopBottomPanel::bottom("footer")
             .resizable(false)
-            .exact_height(36.0)
+            .exact_height(28.0)
             .show(context, |ui| {
-                ui.add_space(7.0);
+                ui.add_space(3.0);
                 ui.horizontal_centered(|ui| {
                     ui.label(
                         egui::RichText::new("开发者：smallcat | GitHub：smallcat2333 | 260904")
@@ -497,26 +532,28 @@ impl eframe::App for QuotaApp {
                             .color(egui::Color32::from_gray(150)),
                     );
                 });
-                ui.add_space(7.0);
+                ui.add_space(3.0);
             });
 
         egui::CentralPanel::default().show(context, |ui| {
             egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
+                .id_salt("dashboard_status")
+                .max_height((ui.available_height() - 240.0).max(220.0))
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    self.draw_keyboard_display(ui);
-                    ui.add_space(10.0);
-                    self.draw_consumption(ui);
-                    ui.add_space(10.0);
                     ui.columns(2, |columns| {
+                        self.draw_keyboard_display(&mut columns[0]);
+                        columns[0].add_space(6.0);
                         self.draw_connection_status(&mut columns[0]);
                         self.draw_quota_status(&mut columns[1]);
+                        columns[1].add_space(6.0);
+                        self.draw_consumption(&mut columns[1]);
                     });
-                    ui.add_space(10.0);
-                    self.draw_actions(ui);
-                    ui.add_space(10.0);
-                    self.draw_details(ui);
                 });
+            ui.add_space(6.0);
+            self.draw_actions(ui);
+            ui.add_space(6.0);
+            self.draw_details(ui);
         });
     }
 }
@@ -552,15 +589,20 @@ fn pixel_color(hsv: &[u8]) -> egui::Color32 {
     }
 }
 
-/// 百万分之一金额以小数原精度展示；未知采样与有效零值保持区分。
+/// 金额按分四舍五入为两位小数，用整数运算避免大金额精度丢失；未知值保持 --。
 fn consumption_text(amount: Option<u64>) -> String {
     match amount {
         None => "--".to_owned(),
         Some(amount) => {
-            let text = format!("{}.{:06}", amount / 1_000_000, amount % 1_000_000);
-            text.trim_end_matches('0').trim_end_matches('.').to_owned()
+            let cents = amount / 10_000 + u64::from(amount % 10_000 >= 5_000);
+            format!("{}.{:02}", cents / 100, cents % 100)
         }
     }
+}
+
+/// 超过采样允许间隔或时间倒退时，不把旧累计当成当前消耗。
+fn sampling_is_stale(sampled_at: Option<i64>, now: i64) -> bool {
+    sampled_at.is_none_or(|timestamp| !(0..=120).contains(&now.saturating_sub(timestamp)))
 }
 
 /// 转换采样时间到本地时分；区间起点的悬浮提示提供完整日期。
@@ -579,8 +621,8 @@ pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
-            .with_inner_size([960.0, 960.0])
-            .with_min_inner_size([760.0, 610.0])
+            .with_inner_size([1160.0, 760.0])
+            .with_min_inner_size([1000.0, 680.0])
             .with_icon(app_icon()),
         renderer: eframe::Renderer::Wgpu,
         persist_window: false,
@@ -729,11 +771,11 @@ fn load_cjk_font() -> Option<(String, Vec<u8>)> {
 /// 绘制统一的分组状态卡。
 fn status_card(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::symmetric(14, 12))
+        .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.heading(title);
-            ui.add_space(8.0);
+            ui.add_space(4.0);
             content(ui);
         });
 }
@@ -845,14 +887,25 @@ fn color_accent() -> egui::Color32 {
 mod display_tests {
     use super::*;
 
-    /// 金额精度不能把微量消耗显示为零，也不能把采样缺失当作零。
+    /// 验证两位小数、四舍五入及未知数据；不通过浮点损失大金额精度。
     #[test]
     fn preserves_consumption_precision_and_missing_values() {
         assert_eq!(consumption_text(None), "--");
-        assert_eq!(consumption_text(Some(0)), "0");
-        assert_eq!(consumption_text(Some(1)), "0.000001");
-        assert_eq!(consumption_text(Some(2_500_000)), "2.5");
-        assert_eq!(consumption_text(Some(u64::MAX)), "18446744073709.551615");
+        assert_eq!(consumption_text(Some(0)), "0.00");
+        assert_eq!(consumption_text(Some(4_999)), "0.00");
+        assert_eq!(consumption_text(Some(5_000)), "0.01");
+        assert_eq!(consumption_text(Some(2_995_000)), "3.00");
+        assert_eq!(consumption_text(Some(2_500_000)), "2.50");
+        assert_eq!(consumption_text(Some(u64::MAX)), "18446744073709.55");
+    }
+
+    /// 旧版后台不再更新共用缓存时，超过两分钟必须识别为过期。
+    #[test]
+    fn detects_stopped_sampling() {
+        assert!(!sampling_is_stale(Some(1000), 1120));
+        assert!(sampling_is_stale(Some(1000), 1121));
+        assert!(sampling_is_stale(None, 1000));
+        assert!(sampling_is_stale(Some(1001), 1000));
     }
 
     /// 验证无缓存、官方及中转点阵可在窄窗口完成真实 egui 布局与绘制。
@@ -908,20 +961,23 @@ mod display_tests {
                 app.display = Some(DisplaySnapshot {
                     frame: Some(crate::keyboard::build_static_frame(&status).unwrap()),
                     relay: status.relay.clone(),
+                    sampled_at: Some(chrono::Utc::now().timestamp()),
                 });
             }
             let output = context.run(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        egui::vec2(760.0, 610.0),
+                        egui::vec2(1000.0, 680.0),
                     )),
                     ..Default::default()
                 },
                 |context| {
                     egui::CentralPanel::default().show(context, |ui| {
-                        app.draw_keyboard_display(ui);
-                        app.draw_consumption(ui);
+                        ui.columns(2, |columns| {
+                            app.draw_keyboard_display(&mut columns[0]);
+                            app.draw_consumption(&mut columns[1]);
+                        });
                     });
                 },
             );

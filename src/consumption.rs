@@ -84,6 +84,11 @@ impl ConsumptionHistory {
         chart.bars[BAR_COUNT - 1] = self.complete.then_some(self.consumed);
         chart
     }
+
+    /// 返回最后一次实际采样时间，供界面识别停止更新的数据。
+    pub fn checked_at(&self) -> i64 {
+        self.last_checked_at
+    }
 }
 
 /// 半小时累计消耗每满 1 USD 点亮一个点，最多五点；金额单位为百万分之一。

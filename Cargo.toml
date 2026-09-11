@@ -1,6 +1,6 @@
 [package]
 name = "codex_keyboard_quota_tool"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Display Codex usage limits on a TICKTYPE DP-104 keyboard on Windows."
