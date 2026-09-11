@@ -2,7 +2,9 @@
 //! Codex 键盘额度工具入口。
 
 mod app;
+mod ccswitch;
 mod codex;
+mod consumption;
 mod deploy;
 mod keyboard;
 mod quota;

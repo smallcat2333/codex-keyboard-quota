@@ -1,5 +1,6 @@
 //! DP-104 HID 通信与 8×24 静态彩色点阵渲染。
 
+use crate::consumption::{ConsumptionChart, consumption_level};
 use crate::quota::{QuotaStatus, WEEK_RESET_CELL_COUNT, format_display_percent};
 use anyhow::{Context, Result, bail};
 use hidapi::{HidApi, HidDevice};
@@ -21,6 +22,8 @@ pub const HSV_YELLOW: [u8; 3] = [43, 255, 255];
 pub const HSV_GREEN: [u8; 3] = [85, 255, 255];
 pub const HSV_WHITE: [u8; 3] = [0, 0, 255];
 pub const HSV_PINK_PURPLE: [u8; 3] = [213, 200, 255];
+pub const HSV_BLUE: [u8; 3] = [170, 255, 255];
+pub const HSV_ORANGE: [u8; 3] = [21, 255, 255];
 
 const GLYPH_0: [&str; 5] = ["111", "101", "101", "101", "111"];
 const GLYPH_1: [&str; 5] = ["010", "110", "010", "010", "111"];
@@ -146,6 +149,9 @@ pub fn quota_color(remaining_percent: Option<u8>) -> [u8; 3] {
 
 /// 渲染固定布局：`5h | 周 | 2×5 沙漏`，输出 8×24×HSV 字节。
 pub fn build_static_frame(status: &QuotaStatus) -> Result<Vec<u8>> {
+    if let Some(relay) = &status.relay {
+        return build_balance_frame(&relay.display_text(), &relay.chart);
+    }
     if status
         .reset_cells
         .is_some_and(|cells| cells > WEEK_RESET_CELL_COUNT)
@@ -225,6 +231,45 @@ pub fn build_static_frame(status: &QuotaStatus) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
+/// 三位余额右对齐占 11 列，12 列画竖线，14–23 列画十根从底部生长的五点柱。
+fn build_balance_frame(text: &str, chart: &ConsumptionChart) -> Result<Vec<u8>> {
+    let glyphs = text.chars().map(glyph).collect::<Result<Vec<_>>>()?;
+    let width =
+        glyphs.iter().map(|rows| rows[0].len()).sum::<usize>() + glyphs.len().saturating_sub(1);
+    if width > 11 {
+        bail!("余额超过三位数字宽度")
+    }
+    let mut frame = vec![0; MATRIX_ROWS * MATRIX_COLS * 3];
+    let mut x = 11 - width;
+    for rows in glyphs {
+        for (y, row) in rows.iter().enumerate() {
+            for (offset, pixel) in row.bytes().enumerate() {
+                if pixel == b'1' {
+                    set_pixel(&mut frame, x + offset, y + 1, HSV_GREEN);
+                }
+            }
+        }
+        x += rows[0].len() + 1;
+    }
+    for y in 1..=5 {
+        set_pixel(&mut frame, 12, y, HSV_WHITE);
+    }
+    for (index, amount) in chart.bars.iter().enumerate() {
+        let Some(amount) = amount else { continue };
+        let level = consumption_level(*amount);
+        let color = match level {
+            0..=2 => HSV_GREEN,
+            3 => HSV_BLUE,
+            4 => HSV_ORANGE,
+            _ => HSV_RED,
+        };
+        for point in 0..level {
+            set_pixel(&mut frame, 14 + index, 5 - point, color);
+        }
+    }
+    Ok(frame)
+}
+
 /// 返回受支持字符的 3×5 或 1×5 字模。
 fn glyph(character: char) -> Result<&'static [&'static str; 5]> {
     match character {
@@ -254,9 +299,55 @@ fn set_pixel(frame: &mut [u8], x: usize, y: usize, color: [u8; 3]) {
 mod tests {
     use super::*;
 
+    /// 验证三位数字间距、竖线、十根柱的位置及各档颜色，最新柱位于最右侧。
+    #[test]
+    fn renders_balance_and_ten_consumption_bars() {
+        let chart = ConsumptionChart {
+            end_at: 1800,
+            bars: [
+                None,
+                None,
+                None,
+                None,
+                Some(0),
+                Some(100_000),
+                Some(1_000_000),
+                Some(2_000_000),
+                Some(5_000_000),
+                Some(10_000_000),
+            ],
+        };
+        let frame = build_balance_frame("999", &chart).unwrap();
+        assert_eq!(frame.len(), MATRIX_ROWS * MATRIX_COLS * 3);
+        for y in 1..=5 {
+            for x in [3, 7, 11, 13, 18] {
+                assert_eq!(pixel(&frame, x, y), [0, 0, 0]);
+            }
+            assert_eq!(pixel(&frame, 12, y), HSV_WHITE);
+            assert_eq!(pixel(&frame, 23, y), HSV_RED);
+        }
+        for (x, level, color) in [
+            (19, 1, HSV_GREEN),
+            (20, 2, HSV_GREEN),
+            (21, 3, HSV_BLUE),
+            (22, 4, HSV_ORANGE),
+        ] {
+            for y in 1..=5 {
+                assert_eq!(
+                    pixel(&frame, x, y),
+                    if y > 5 - level { color } else { [0, 0, 0] }
+                );
+            }
+        }
+        for text in ["0", "22", "148", "--"] {
+            assert!(build_balance_frame(text, &ConsumptionChart::default()).is_ok());
+        }
+    }
+
     /// 构造点阵测试状态。
     fn status(five_hour: Option<u8>, seven_day: Option<u8>, cells: Option<u8>) -> QuotaStatus {
         QuotaStatus {
+            relay: None,
             five_hour,
             seven_day,
             seven_day_resets_at: None,

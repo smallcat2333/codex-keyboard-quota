@@ -167,7 +167,7 @@ impl QuotaApp {
             );
             connection_row(
                 ui,
-                "Codex 登录",
+                "额度来源",
                 snapshot.map(|value| value.codex_connected),
                 snapshot
                     .map(|value| value.codex_detail.as_str())
@@ -197,25 +197,36 @@ impl QuotaApp {
                 .snapshot
                 .as_ref()
                 .and_then(|value| value.quota.as_ref());
-            quota_row(ui, "5h 额度", quota.and_then(|value| value.five_hour));
-            quota_row(ui, "周额度", quota.and_then(|value| value.seven_day));
-            text_row(
-                ui,
-                "周重置时间",
-                quota
-                    .map(QuotaStatus::reset_time_text)
-                    .unwrap_or_else(|| "--".to_owned())
-                    .as_str(),
-            );
-            text_row(
-                ui,
-                "当前沙漏",
-                quota
-                    .and_then(|value| value.reset_cells)
-                    .map(|cells| format!("{cells} / 10 格"))
-                    .unwrap_or_else(|| "--".to_owned())
-                    .as_str(),
-            );
+            if let Some(relay) = quota.and_then(|value| value.relay.as_ref()) {
+                text_row(ui, "中转站", &relay.name);
+                text_row(
+                    ui,
+                    "剩余额度",
+                    &format!("{} {}", relay.display_text(), relay.unit),
+                );
+                text_row(ui, "查询状态", &relay.detail);
+                text_row(ui, "消耗柱", "10 柱 × 30 分钟累计，最右侧最新");
+            } else {
+                quota_row(ui, "5h 额度", quota.and_then(|value| value.five_hour));
+                quota_row(ui, "周额度", quota.and_then(|value| value.seven_day));
+                text_row(
+                    ui,
+                    "周重置时间",
+                    quota
+                        .map(QuotaStatus::reset_time_text)
+                        .unwrap_or_else(|| "--".to_owned())
+                        .as_str(),
+                );
+                text_row(
+                    ui,
+                    "当前沙漏",
+                    quota
+                        .and_then(|value| value.reset_cells)
+                        .map(|cells| format!("{cells} / 10 格"))
+                        .unwrap_or_else(|| "--".to_owned())
+                        .as_str(),
+                );
+            }
             text_row(
                 ui,
                 "最近检测",
@@ -421,7 +432,7 @@ fn run_task(task: BackgroundTask) -> Result<TaskCompletion> {
             let details = vec![
                 snapshot.keyboard_detail.clone(),
                 if snapshot.codex_connected {
-                    format!("Codex CLI：{}", snapshot.codex_detail)
+                    format!("额度来源：{}", snapshot.codex_detail)
                 } else {
                     snapshot.codex_detail.clone()
                 },
@@ -446,7 +457,7 @@ fn run_task(task: BackgroundTask) -> Result<TaskCompletion> {
             let snapshot = service::snapshot_from_refresh(&outcome);
             Ok(TaskCompletion {
                 details: vec![
-                    format!("Codex CLI：{}", outcome.codex_command),
+                    format!("额度来源：{}", outcome.codex_command),
                     outcome.summary(),
                     "DP-104 HID 回显校验通过".to_owned(),
                 ],

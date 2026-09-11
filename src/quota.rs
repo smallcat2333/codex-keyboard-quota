@@ -1,5 +1,7 @@
 //! 额度状态、阈值判断、显示格式和注册表缓存。
 
+use crate::ccswitch::RelayBalance;
+use crate::consumption::{ConsumptionChart, ConsumptionHistory};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local};
 use std::io::ErrorKind;
@@ -18,9 +20,10 @@ const REGISTRY_SEVEN_DAY_VALUE: &str = "SevenDayRemaining";
 const REGISTRY_WEEK_RESET_CELLS_VALUE: &str = "SevenDayResetCells";
 const REGISTRY_UNLIMITED_VALUE: &str = "--";
 
-/// 一次 Codex 限额查询的完整结果。
+/// 一次官方额度或 CCSwitch 中转余额查询；relay 存在时不使用官方窗口字段。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuotaStatus {
+    pub relay: Option<RelayBalance>,
     pub five_hour: Option<u8>,
     pub seven_day: Option<u8>,
     pub seven_day_resets_at: Option<i64>,
@@ -30,14 +33,20 @@ pub struct QuotaStatus {
 /// 上次已经成功写入键盘的注册表状态。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordedStatus {
+    pub relay: Option<RelayBalance>,
     pub five_hour: Option<u8>,
     pub seven_day: Option<u8>,
     pub reset_cells: Option<u8>,
 }
 
 impl QuotaStatus {
-    /// 生成固定为“5h|周%”的可读文本。
+    /// 官方生成“5h|周%”，中转站生成余额与原始单位。
     pub fn display_message(&self) -> String {
+        if let Some(relay) = &self.relay {
+            return format!("{} {}", relay.display_text(), relay.unit)
+                .trim()
+                .to_owned();
+        }
         format!(
             "{}|{}%",
             format_display_percent(self.five_hour),
@@ -48,6 +57,7 @@ impl QuotaStatus {
     /// 生成适合写入注册表的已显示状态。
     fn recorded(&self) -> RecordedStatus {
         RecordedStatus {
+            relay: self.relay.clone(),
             five_hour: self.five_hour,
             seven_day: self.seven_day,
             reset_cells: self.reset_cells,
@@ -93,6 +103,20 @@ pub fn should_refresh(current: &QuotaStatus, recorded: Option<&RecordedStatus>) 
         return true;
     };
 
+    match (&current.relay, &recorded.relay) {
+        (Some(current), Some(recorded)) => {
+            return current.provider_id != recorded.provider_id
+                || current.unit != recorded.unit
+                || current.chart != recorded.chart
+                || match (current.remaining, recorded.remaining) {
+                    (Some(current), Some(recorded)) => current.abs_diff(recorded) >= 1_000_000,
+                    (current, recorded) => current != recorded,
+                };
+        }
+        (Some(_), None) | (None, Some(_)) => return true,
+        (None, None) => {}
+    }
+
     if low_quota_changed(current.five_hour, recorded.five_hour)
         || low_quota_changed(current.seven_day, recorded.seven_day)
     {
@@ -133,6 +157,37 @@ pub fn read_recorded_status() -> Result<Option<RecordedStatus>> {
         Err(error) => return Err(error).context("无法打开额度注册表缓存"),
     };
 
+    match key.get_value::<String, _>("DisplaySource") {
+        Ok(source) if source == "relay" => {
+            let chart = match key.get_value::<String, _>("RelayChart") {
+                Ok(text) => serde_json::from_str(&text).context("消耗柱缓存格式错误")?,
+                Err(error) if error.kind() == ErrorKind::NotFound => ConsumptionChart::default(),
+                Err(error) => return Err(error).context("无法读取消耗柱缓存"),
+            };
+            let text: String = key.get_value("RelayRemaining")?;
+            return Ok(Some(RecordedStatus {
+                relay: Some(RelayBalance {
+                    chart,
+                    provider_id: key.get_value("RelayProvider")?,
+                    name: String::new(),
+                    remaining: if text == "--" {
+                        None
+                    } else {
+                        Some(text.parse().context("余额缓存格式错误")?)
+                    },
+                    unit: key.get_value("RelayUnit")?,
+                    detail: String::new(),
+                }),
+                five_hour: None,
+                seven_day: None,
+                reset_cells: None,
+            }));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("无法读取额度来源缓存"),
+    }
+
     let Some(five_hour) = read_optional_registry_number(&key, REGISTRY_FIVE_HOUR_VALUE, 100)?
     else {
         return Ok(None);
@@ -151,6 +206,7 @@ pub fn read_recorded_status() -> Result<Option<RecordedStatus>> {
     };
 
     Ok(Some(RecordedStatus {
+        relay: None,
         five_hour,
         seven_day,
         reset_cells,
@@ -164,6 +220,20 @@ pub fn write_recorded_status(status: &QuotaStatus) -> Result<()> {
         .create_subkey(REGISTRY_PATH)
         .context("无法创建额度注册表缓存")?;
     let recorded = status.recorded();
+    if let Some(relay) = &recorded.relay {
+        key.set_value("RelayProvider", &relay.provider_id)?;
+        key.set_value(
+            "RelayRemaining",
+            &relay
+                .remaining
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "--".to_owned()),
+        )?;
+        key.set_value("RelayUnit", &relay.unit)?;
+        key.set_value("RelayChart", &serde_json::to_string(&relay.chart)?)?;
+        key.set_value("DisplaySource", &"relay")?;
+        return Ok(());
+    }
     key.set_value(
         REGISTRY_FIVE_HOUR_VALUE,
         &registry_number_text(recorded.five_hour),
@@ -179,6 +249,31 @@ pub fn write_recorded_status(status: &QuotaStatus) -> Result<()> {
         &registry_number_text(recorded.reset_cells),
     )
     .context("无法记录周重置沙漏")?;
+    key.set_value("DisplaySource", &"official")?;
+    Ok(())
+}
+
+/// 每次查询都持久化采样，独立于 HID 刷新阈值；按供应商与单位隔离历史。
+pub fn sample_consumption(relay: &mut RelayBalance, now: i64) -> Result<()> {
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = current_user
+        .create_subkey(REGISTRY_PATH)
+        .context("无法创建消耗采样缓存")?;
+    let name = format!(
+        "Consumption:{}",
+        serde_json::to_string(&(&relay.provider_id, &relay.unit))?
+    );
+    let mut history: ConsumptionHistory = match key.get_value::<String, _>(&name) {
+        Ok(text) => serde_json::from_str(&text).context("消耗采样缓存格式错误")?,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            ConsumptionHistory::new(now, relay.remaining)
+        }
+        Err(error) => return Err(error).context("无法读取消耗采样缓存"),
+    };
+    history.sample(now, relay.remaining);
+    relay.chart = history.chart();
+    key.set_value(&name, &serde_json::to_string(&history)?)
+        .context("无法保存消耗采样缓存")?;
     Ok(())
 }
 
@@ -237,9 +332,49 @@ fn parse_registry_number(text: &str, name: &str, maximum: u8) -> Result<Option<u
 mod tests {
     use super::*;
 
+    /// 验证阈值相对上次成功显示累计计算，并覆盖供应商、币种及可用性切换。
+    #[test]
+    fn refreshes_relay_at_one_unit_and_on_source_changes() {
+        let mut current = status(None, None, None);
+        current.relay = Some(RelayBalance {
+            chart: ConsumptionChart::default(),
+            provider_id: "relay-a".to_owned(),
+            name: "A".to_owned(),
+            remaining: Some(148_100_000),
+            unit: "USD".to_owned(),
+            detail: String::new(),
+        });
+        let recorded = current.recorded();
+        current.relay.as_mut().unwrap().chart.end_at = 1800;
+        assert!(should_refresh(&current, Some(&recorded)));
+        current.relay.as_mut().unwrap().chart.end_at = 0;
+        current.relay.as_mut().unwrap().remaining = Some(147_100_001);
+        assert!(!should_refresh(&current, Some(&recorded)));
+        current.relay.as_mut().unwrap().remaining = Some(147_100_000);
+        assert!(should_refresh(&current, Some(&recorded)));
+        current.relay.as_mut().unwrap().remaining = Some(149_100_000);
+        assert!(should_refresh(&current, Some(&recorded)));
+        current.relay.as_mut().unwrap().remaining = Some(148_100_000);
+        current.relay.as_mut().unwrap().provider_id = "relay-b".to_owned();
+        assert!(should_refresh(&current, Some(&recorded)));
+        current.relay.as_mut().unwrap().provider_id = "relay-a".to_owned();
+        current.relay.as_mut().unwrap().unit = "CNY".to_owned();
+        assert!(should_refresh(&current, Some(&recorded)));
+        current.relay.as_mut().unwrap().remaining = None;
+        assert!(should_refresh(&current, Some(&recorded)));
+        let unavailable = current.recorded();
+        assert!(!should_refresh(&current, Some(&unavailable)));
+        current.relay.as_mut().unwrap().remaining = Some(148_100_000);
+        assert!(should_refresh(&current, Some(&unavailable)));
+        let official = status(None, None, None);
+        assert!(should_refresh(&official, Some(&recorded)));
+        assert!(should_refresh(&current, Some(&official.recorded())));
+    }
+
     /// 创建用于阈值测试的额度状态。
     fn status(five_hour: Option<u8>, seven_day: Option<u8>, cells: Option<u8>) -> QuotaStatus {
         QuotaStatus {
+            relay: None,
             five_hour,
             seven_day,
             seven_day_resets_at: None,
@@ -260,6 +395,7 @@ mod tests {
     #[test]
     fn refreshes_at_equal_thresholds() {
         let recorded = RecordedStatus {
+            relay: None,
             five_hour: Some(50),
             seven_day: Some(50),
             reset_cells: Some(10),
@@ -282,6 +418,7 @@ mod tests {
     #[test]
     fn refreshes_every_low_quota_change() {
         let recorded = RecordedStatus {
+            relay: None,
             five_hour: Some(4),
             seven_day: Some(4),
             reset_cells: Some(1),
@@ -296,6 +433,7 @@ mod tests {
         ));
 
         let five_percent = RecordedStatus {
+            relay: None,
             five_hour: Some(6),
             seven_day: Some(6),
             reset_cells: Some(1),
@@ -310,6 +448,7 @@ mod tests {
     #[test]
     fn ignores_hourglass_only_change() {
         let recorded = RecordedStatus {
+            relay: None,
             five_hour: Some(40),
             seven_day: Some(29),
             reset_cells: Some(10),
@@ -324,6 +463,7 @@ mod tests {
     #[test]
     fn refreshes_when_window_appears_or_disappears() {
         let recorded = RecordedStatus {
+            relay: None,
             five_hour: None,
             seven_day: Some(82),
             reset_cells: Some(7),

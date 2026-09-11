@@ -1,5 +1,6 @@
 //! 查询、阈值判断、HID 写入和后台日志的业务编排。
 
+use crate::ccswitch;
 use crate::codex;
 use crate::deploy;
 use crate::keyboard::{self, Dp104Keyboard};
@@ -30,6 +31,20 @@ pub struct RefreshOutcome {
 impl RefreshOutcome {
     /// 生成适合详情框或后台日志的一行结果。
     pub fn summary(&self) -> String {
+        if let Some(relay) = &self.status.relay {
+            return format!(
+                "{} {}：{}，{}；{}",
+                self.checked_at,
+                relay.name,
+                self.status.display_message(),
+                if self.action == RefreshAction::Refreshed {
+                    "已刷新键盘"
+                } else {
+                    "变化未达阈值，未写键盘"
+                },
+                relay.detail
+            );
+        }
         match self.action {
             RefreshAction::Refreshed => format!(
                 "{} 已刷新键盘：{}，沙漏 {} 格",
@@ -75,7 +90,10 @@ impl Drop for RefreshLock {
 pub fn refresh_once(force: bool) -> Result<RefreshOutcome> {
     let _lock = acquire_refresh_lock()?
         .ok_or_else(|| anyhow::anyhow!("另一个刷新进程正在运行，请稍后重试"))?;
-    let (status, codex_command) = codex::query_current_quota()?;
+    let (mut status, codex_command) = query_selected_quota()?;
+    if let Some(relay) = &mut status.relay {
+        quota::sample_consumption(relay, chrono::Utc::now().timestamp())?;
+    }
     let checked_at = current_time_text();
     let recorded = quota::read_recorded_status()?;
     if !force && !quota::should_refresh(&status, recorded.as_ref()) {
@@ -107,10 +125,14 @@ pub fn collect_system_snapshot() -> SystemSnapshot {
         Ok(false) => (false, "未发现 DP-104 厂商 HID".to_owned()),
         Err(error) => (false, format!("HID 检测失败：{error:#}")),
     };
-    let (codex_connected, codex_detail, quota, last_result) = match codex::query_current_quota() {
+    let (codex_connected, codex_detail, quota, last_result) = match query_selected_quota() {
         Ok((status, command)) => {
             let result = format!("已读取当前账号额度：{}", status.display_message());
-            (true, command, Some(status), result)
+            let connected = status
+                .relay
+                .as_ref()
+                .is_none_or(|relay| relay.remaining.is_some());
+            (connected, command, Some(status), result)
         }
         Err(error) => {
             let detail = format!("Codex 查询失败：{error:#}");
@@ -128,6 +150,24 @@ pub fn collect_system_snapshot() -> SystemSnapshot {
         checked_at,
         last_result,
     }
+}
+
+/// 按 CCSwitch 当前供应商分流；中转站无余额不回退到官方账号额度。
+fn query_selected_quota() -> Result<(QuotaStatus, String)> {
+    if let Some(relay) = ccswitch::query_current_balance()? {
+        let source = format!("CCSwitch / {}：{}", relay.name, relay.detail);
+        return Ok((
+            QuotaStatus {
+                relay: Some(relay),
+                five_hour: None,
+                seven_day: None,
+                seven_day_resets_at: None,
+                reset_cells: None,
+            },
+            source,
+        ));
+    }
+    codex::query_current_quota()
 }
 
 /// 由计划任务调用一次；普通跳过保持静默，只记录真实刷新和错误。
@@ -156,7 +196,11 @@ pub fn snapshot_from_refresh(outcome: &RefreshOutcome) -> SystemSnapshot {
     SystemSnapshot {
         keyboard_connected: true,
         keyboard_detail: "DP-104 HID 写入及回显校验成功".to_owned(),
-        codex_connected: true,
+        codex_connected: outcome
+            .status
+            .relay
+            .as_ref()
+            .is_none_or(|relay| relay.remaining.is_some()),
         codex_detail: outcome.codex_command.clone(),
         deployed: deploy::is_deployed(),
         quota: Some(outcome.status.clone()),
@@ -222,6 +266,6 @@ mod integration_tests {
     fn queries_real_account_and_writes_dp104() {
         let outcome = refresh_once(true).expect("真机额度显示失败");
         assert_eq!(outcome.action, RefreshAction::Refreshed);
-        assert_eq!(outcome.status.display_message().len(), 6);
+        assert!(!outcome.status.display_message().is_empty());
     }
 }

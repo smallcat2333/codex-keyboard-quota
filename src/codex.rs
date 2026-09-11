@@ -239,6 +239,7 @@ pub fn parse_rate_limits(result: &Value, now: i64) -> Result<QuotaStatus> {
 
     let reset_cells = calculate_week_reset_cells(seven_day_resets_at, now);
     Ok(QuotaStatus {
+        relay: None,
         five_hour,
         seven_day,
         seven_day_resets_at,
